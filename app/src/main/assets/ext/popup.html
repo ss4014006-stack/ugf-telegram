@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>UI GOD FATHER SUMIT V3 AMPLIFIER</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body data-power="on">
+  <main class="panel">
+    <header class="hero">
+      <button id="powerToggle" class="powerToggle" type="button" aria-pressed="true" aria-label="Turn voice processing off">
+        <img id="powerLogo" src="assets/ui-fighter-tiger.jpg" alt="UI GOD FATHER SUMIT V3 logo" />
+        <span class="toggleRing" aria-hidden="true"></span>
+      </button>
+      <div class="brandText"><p class="brandKicker">UI // AUDIO LAB</p><h1 class="brandTitle">UI GOD FATHER SUMIT V3</h1><p class="eyebrow">AUDIO AMPLIFIER ENGINE</p></div>
+      <div class="livePill"><span class="liveDot"></span><span>AMP LIVE</span></div>
+    </header>
+    <section class="fighterHero">
+              <div class="fighterArt"><img src="assets/ui-fighter-tiger.jpg" alt="UI GOD FATHER SUMIT V3"></div>
+              <div class="heroStats">
+                <div class="boostBadge" id="boostBadge">POWER MODE</div>
+                <strong>MAX POWER • PURE SOUND</strong>
+                <div class="miniWave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+              </div>
+            </section><section class="powerRail"><div class="powerRailMark"><span></span><span></span><span></span></div><div><strong id="toggleText">UI GOD FATHER SUMIT V3 AUDIO ON</strong><small>Tap the logo to switch to clean mic</small></div><span class="railChevron">›</span></section>
+    <section class="voiceSection"><div class="sectionHeading"><div><span class="sectionIndex">01 / VOICE LAB</span><h2>Amplifier presets</h2></div><span class="scrollHint">SWIPE</span></div><div class="preset-buttons">
+      <button class="preset-btn p1" id="preset1" type="button"><span class="p-icon">⚡</span><span class="p-title">Full Power</span><span class="p-sub">balanced boost</span></button>
+      <button class="preset-btn p2" id="preset2" type="button"><span class="p-icon">✦</span><span class="p-title">Nuclear</span><span class="p-sub">strong boost</span></button>
+      <button class="preset-btn p3" id="preset3" type="button"><span class="p-icon">◆</span><span class="p-title">Godmode</span><span class="p-sub">max amplifier</span></button>
+    </div></section>
+    <section class="meterSection"><div class="sectionHeading"><div><span class="sectionIndex">02 / LIVE MONITOR</span><h2>Amplifier level</h2></div><span class="deckStatus" id="meterStatus">READY</span></div><div class="meterCard"><div class="meterScale"><span>-6</span><span>-12</span><span>-24</span><span>-48</span></div><div class="meterTrack"><div id="levelBar" class="levelBar"></div></div><div class="meterReadout"><strong id="levelValue">0%</strong><span>LIVE INPUT</span></div></div></section>
+    <section class="controlSection"><div class="controlStatus" id="controlStatus">LIVE CONTROLS READY • MOVE ANY SLIDER</div><div class="sectionHeading"><div><span class="sectionIndex">03 / CONTROL DECK</span><h2>Control the amplifier</h2></div><span class="deckStatus">READY</span></div>
+      <div class="slider-container"><div class="slider-top"><label for="volume">MASTER VOLUME</label><span class="value" id="volumeValue"></span></div><input id="volume" type="range" min="1" max="9000" step="10" value="3000" /></div>
+      <div class="slider-container"><div class="slider-top"><label for="micGain">MIC AMPLIFIER</label><span class="value" id="micGainValue"></span></div><input id="micGain" type="range" min="0" max="9000" step="10" value="2500" /></div>
+      <div class="slider-container"><div class="slider-top"><label for="bass">BASS</label><span class="value" id="bassValue"></span></div><input id="bass" type="range" min="0" max="9000" step="10" value="250" /></div>
+      <div class="slider-container"><div class="slider-top"><label for="treble">TREBLE</label><span class="value" id="trebleValue"></span></div><input id="treble" type="range" min="0" max="9000" step="10" value="500" /></div>
+      <div class="slider-container"><div class="slider-top"><label for="sharpness">SHARPNESS</label><span class="value" id="sharpnessValue"></span></div><input id="sharpness" type="range" min="0" max="9000" step="10" value="500" /></div>
+      <div class="slider-container"><div class="slider-top"><label for="noiseGate">NOISE GATE <em>(OPTIONAL)</em></label><span class="value" id="noiseGateValue"></span></div><input id="noiseGate" type="range" min="0" max="500" step="1" value="0" /></div>
+      <div class="slider-container"><div class="slider-top"><label for="echo">ECHO</label><span class="value" id="echoValue"></span></div><input id="echo" type="range" min="0" max="500" step="1" value="15" /></div>
+      <div class="slider-container"><div class="slider-top"><label for="compression">COMPRESSOR</label><span class="value" id="compressionValue"></span></div><input id="compression" type="range" min="0" max="500" step="1" value="55" /></div>
+      <div class="slider-container"><div class="slider-top"><label for="limiter">LIMITER</label><span class="value" id="limiterValue"></span></div><input id="limiter" type="range" min="0" max="500" step="1" value="80" /></div>
+      <div class="quickControls">
+              <button class="quickBtn active" id="gateQuick" type="button" aria-pressed="true"><span>NOISE GATE</span><b>ON</b></button>
+              <button class="quickBtn active" id="compQuick" type="button" aria-pressed="true"><span>COMPRESSOR</span><b>ON</b></button>
+              <button class="quickBtn active" id="limitQuick" type="button" aria-pressed="true"><span>LIMITER</span><b>ON</b></button>
+            </div>
+            <div class="eqView">
+              <div class="eqHead"><span>EQUALIZER VIEW</span><small>LIVE</small></div>
+              <div class="eqBars"><i style="--h:34%"></i><i style="--h:58%"></i><i style="--h:42%"></i><i style="--h:76%"></i><i style="--h:52%"></i><i style="--h:88%"></i><i style="--h:64%"></i><i style="--h:48%"></i><i style="--h:70%"></i><i style="--h:56%"></i><i style="--h:38%"></i></div>
+            </div><button id="resetBtn" class="reset-btn" type="button">RESET ALL SETTINGS</button>
+    </section>
+    <footer><strong>UI GOD FATHER SUMIT V3</strong><br />Real-time UI GOD FATHER SUMIT V3 amplifier engine.</footer>
+  <nav class="bottomNav" aria-label="UI FIGHTER sections">
+              <button class="navActive" type="button">◉<span>AMPLIFIER</span></button>
+              <button type="button">☷<span>EQUALIZER</span></button>
+              <button type="button">●<span>RECORDER</span></button>
+              <button type="button">▶<span>PLAYER</span></button>
+              <button type="button">⚙<span>SETTINGS</span></button>
+            </nav></main>
+  <script src="shim.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

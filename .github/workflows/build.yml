@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
       - name: Checkout this repo (for tiger.jpg)
@@ -168,7 +168,7 @@ jobs:
           write(gp, t.rstrip("\n") + "\norg.gradle.jvmargs=-Xmx5g -Dfile.encoding=UTF-8\norg.gradle.daemon=false\n")
           print("[done] patch complete")
           PYEOF
-          python3 /tmp/patch.py tg "${{ github.event.inputs.mic_gain }}" "$GITHUB_WORKSPACE/tiger.jpg"
+          (python3 -c "import PIL" 2>/dev/null || (sudo apt-get update -qq; sudo apt-get install -y python3-pil)) && python3 /tmp/patch.py tg "${{ github.event.inputs.mic_gain }}" "$GITHUB_WORKSPACE/tiger.jpg"
 
       - name: Install Android NDK / SDK pieces
         run: |

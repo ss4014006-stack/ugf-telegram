@@ -1,33 +1,211 @@
-name: Build APK
+name: Build UI Fighter Telegram
+
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      mic_gain:
+        description: "Mic gain multiplier (1 = normal, 4 = loud, 10 = very loud)"
+        default: "4"
+
 permissions:
   contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 300
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout this repo (for tiger.jpg)
+        uses: actions/checkout@v4
+
+      - name: Checkout official Telegram source (latest)
+        uses: actions/checkout@v4
+        with:
+          repository: DrKLO/Telegram
+          path: tg
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/system-images /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.7
-      - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
-      - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk UGF-Telegram.apk
+          java-version: "17"
+
+      - name: Patch Telegram (keys, mic boost, name, tiger icon)
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          cat > /tmp/patch.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """UI FIGHTER patcher for DrKLO/Telegram source. Usage: patch.py <tg_dir> <gain> <icon_path_or_empty>"""
+          import os, re, sys, glob
+
+          tg, gain, icon = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+          app_id, app_hash = os.environ.get("TG_API_ID", ""), os.environ.get("TG_API_HASH", "")
+          NAME = "UI Fighter"
+
+          def read(p):
+              with open(p, encoding="utf-8", errors="surrogateescape") as f: return f.read()
+          def write(p, s):
+              with open(p, "w", encoding="utf-8", errors="surrogateescape") as f: f.write(s)
+
+          # ---------- 1. API keys ----------
+          if not (app_id.strip().isdigit() and len(app_hash.strip()) == 32):
+              sys.exit("ERROR: Secrets TG_API_ID / TG_API_HASH missing or wrong (hash 32 chars). Get them from my.telegram.org")
+          bv = glob.glob(f"{tg}/**/BuildVars.java", recursive=True)
+          if not bv: sys.exit("ERROR: BuildVars.java not found")
+          s = read(bv[0])
+          s, n1 = re.subn(r"(APP_ID\s*=\s*)\d+", r"\g<1>" + app_id.strip(), s)
+          s, n2 = re.subn(r'(APP_HASH\s*=\s*)"[^"]*"', r'\g<1>"' + app_hash.strip() + '"', s)
+          write(bv[0], s)
+          print(f"[keys] BuildVars patched ({n1},{n2})")
+
+          # ---------- 2. Gain class ----------
+          java = '''package org.telegram.messenger;
+
+          import java.nio.ByteBuffer;
+          import java.nio.ByteOrder;
+
+          /** UI FIGHTER mic amplifier: gain + soft limiter (tanh). Never throws. */
+          public class UgfGain {
+              public static final float GAIN = %sf;
+
+              private static short amp(short s) {
+                  float x = (s / 32768f) * GAIN;
+                  return (short) (Math.tanh(x) * 32000f);
+              }
+
+              public static void process(ByteBuffer buf, int bytes) {
+                  try {
+                      if (buf == null || bytes < 2) return;
+                      ByteBuffer b = buf.duplicate().order(ByteOrder.LITTLE_ENDIAN);
+                      int n = Math.min(bytes, b.capacity()) & ~1;
+                      for (int i = 0; i < n; i += 2) b.putShort(i, amp(b.getShort(i)));
+                  } catch (Throwable ignore) {}
+              }
+
+              public static void process(byte[] a, int bytes) {
+                  try {
+                      if (a == null || bytes < 2) return;
+                      int n = Math.min(bytes, a.length) & ~1;
+                      for (int i = 0; i < n; i += 2) {
+                          short s = (short) ((a[i] & 0xff) | (a[i + 1] << 8));
+                          s = amp(s);
+                          a[i] = (byte) (s & 0xff);
+                          a[i + 1] = (byte) ((s >> 8) & 0xff);
+                      }
+                  } catch (Throwable ignore) {}
+              }
+
+              public static void process(short[] a, int samples) {
+                  try {
+                      if (a == null || samples < 1) return;
+                      int n = Math.min(samples, a.length);
+                      for (int i = 0; i < n; i++) a[i] = amp(a[i]);
+                  } catch (Throwable ignore) {}
+              }
+          }
+          ''' % repr(gain)
+          src_roots = glob.glob(f"{tg}/TMessagesProj/src/main/java/org/telegram/messenger")
+          if not src_roots: sys.exit("ERROR: org/telegram/messenger dir not found")
+          write(os.path.join(src_roots[0], "UgfGain.java"), java)
+
+          # ---------- 3. Hook every AudioRecord.read(...) ----------
+          pat = re.compile(r"((?:int\s+)?(\w+)\s*=\s*(\w*(?:[aA]udioRecord|recorder)\w*)\.read\(\s*([A-Za-z_][\w\.]*)\s*,[^;]*;)")
+          hits = []
+          for p in glob.glob(f"{tg}/**/*.java", recursive=True):
+              t = read(p)
+              if "AudioRecord" not in t or "UgfGain" in t: continue
+              def rep(m):
+                  stmt, var, _, arg = m.groups()
+                  hits.append((p, stmt))
+                  return f"{stmt} if ({var} > 0) org.telegram.messenger.UgfGain.process({arg}, {var});"
+              t2 = pat.sub(rep, t)
+              if t2 != t: write(p, t2)
+          for p, l in hits: print(f"[hook] {os.path.relpath(p, tg)} :: {l}")
+          if not hits: sys.exit("ERROR: no AudioRecord.read(...) found, hook failed (Telegram source changed). Send this log to Claude.")
+
+          # ---------- 4. App name ----------
+          cnt = 0
+          for p in glob.glob(f"{tg}/**/res/values/*.xml", recursive=True):
+              t = read(p)
+              t2 = re.sub(r'(<string\s+name="(?:AppName|app_name|AppNameBeta)"[^>]*>)[^<]*(</string>)', r"\g<1>" + NAME + r"\g<2>", t)
+              if t2 != t: write(p, t2); cnt += 1
+          print(f"[name] {cnt} files renamed to {NAME}")
+
+          # ---------- 5. Icon ----------
+          if icon and os.path.isfile(icon):
+              from PIL import Image, ImageDraw
+              img = Image.open(icon).convert("RGBA")
+              w, h = img.size; m = min(w, h)
+              img = img.crop(((w-m)//2, (h-m)//2, (w-m)//2+m, (h-m)//2+m))
+              res_dirs = set()
+              for p in glob.glob(f"{tg}/**/res/mipmap-*/ic_launcher*.*", recursive=True) + glob.glob(f"{tg}/**/res/drawable*/ic_launcher*.*", recursive=True):
+                  res_dirs.add(p.split("/res/")[0] + "/res")
+              app_res = [d for d in res_dirs if "TMessagesProj_App" in d]
+              target = (app_res or sorted(res_dirs) or [f"{tg}/TMessagesProj_App/src/main/res"])[0]
+              for d in res_dirs:
+                  for p in glob.glob(f"{d}/mipmap-*/ic_launcher*.*") + glob.glob(f"{d}/drawable*/ic_launcher*.*"):
+                      os.remove(p)
+              dens = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+              for k, sz in dens.items():
+                  d = f"{target}/mipmap-{k}"; os.makedirs(d, exist_ok=True)
+                  sq = img.resize((sz, sz), Image.LANCZOS); sq.save(f"{d}/ic_launcher.png")
+                  mask = Image.new("L", (sz, sz), 0); ImageDraw.Draw(mask).ellipse((0, 0, sz-1, sz-1), fill=255)
+                  rd = Image.new("RGBA", (sz, sz), (0, 0, 0, 0)); rd.paste(sq, (0, 0), mask); rd.save(f"{d}/ic_launcher_round.png")
+              print(f"[icon] tiger icon written to {target}")
+          else:
+              print("[icon] tiger.jpg not found - icon unchanged")
+
+          # ---------- 6. gradle memory ----------
+          gp = os.path.join(tg, "gradle.properties")
+          t = read(gp) if os.path.exists(gp) else ""
+          t = re.sub(r"(?m)^org\.gradle\.jvmargs=.*$\n?", "", t)
+          write(gp, t.rstrip("\n") + "\norg.gradle.jvmargs=-Xmx5g -Dfile.encoding=UTF-8\norg.gradle.daemon=false\n")
+          print("[done] patch complete")
+          PYEOF
+          python3 /tmp/patch.py tg "${{ github.event.inputs.mic_gain }}" "$GITHUB_WORKSPACE/tiger.jpg"
+
+      - name: Install Android NDK / SDK pieces
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          NDK=$(grep -rhoE 'ndkVersion[ =]+"?[0-9.]+' tg --include=build.gradle* | head -1 | grep -oE '[0-9.]+$' || true)
+          echo "NDK wanted: $NDK"
+          if [ -n "$NDK" ]; then sdkmanager "ndk;$NDK" || true; fi
+          sdkmanager "cmake;3.22.1" || true
+
+      - name: Build APK
+        working-directory: tg
+        run: |
+          chmod +x gradlew
+          ./gradlew :TMessagesProj_App:tasks --all --no-daemon -q | grep -iE "^assemble" | head -30 || true
+          TASK=$(./gradlew :TMessagesProj_App:tasks --all --no-daemon -q | grep -oiE "^assemble[A-Za-z0-9_]*Debug" | grep -iE "afat" | head -1 || true)
+          if [ -z "$TASK" ]; then TASK=$(./gradlew :TMessagesProj_App:tasks --all --no-daemon -q | grep -oiE "^assemble[A-Za-z0-9_]*Debug" | head -1); fi
+          echo "BUILDING: $TASK"
+          ./gradlew ":TMessagesProj_App:$TASK" --no-daemon --stacktrace
+          find . -name "*.apk" -path "*outputs*"
+
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          APK=$(find tg -name "*.apk" -path "*outputs*" | grep -i -E "arm64|afat|universal" | head -1)
+          [ -z "$APK" ] && APK=$(find tg -name "*.apk" -path "*outputs*" | head -1)
+          echo "APK=$APK"
+          cp "$APK" out/UI-Fighter-Telegram.apk
+
       - uses: actions/upload-artifact@v4
         with:
-          name: UGF-Telegram-APK
-          path: UGF-Telegram.apk
-      - name: Publish release (direct phone download)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: UGF Telegram build ${{ github.run_number }}
-          files: UGF-Telegram.apk
+          name: UI-Fighter-Telegram
+          path: out/UI-Fighter-Telegram.apk
+
+      - name: Publish release (direct download link)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "ugf-${{ github.run_number }}" out/UI-Fighter-Telegram.apk \
+            --title "UI Fighter build ${{ github.run_number }}" \
+            --notes "Official Telegram source + UI Fighter mic boost (gain ${{ github.event.inputs.mic_gain }})"

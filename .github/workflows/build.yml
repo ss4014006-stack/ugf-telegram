@@ -138,37 +138,56 @@ jobs:
               if t2 != t: write(p, t2); cnt += 1
           print(f"[name] {cnt} files renamed to {NAME}")
 
-          # ---------- 5. Icon (manifest-driven, exact names only) ----------
+          # ---------- 5. Icon: replace IN PLACE (same res root as each original) ----------
+          def app_icon_names():
+              names = {"ic_launcher", "ic_launcher_round"}
+              for mf in glob.glob(f"{tg}/**/AndroidManifest.xml", recursive=True):
+                  if "/build/" in mf: continue
+                  am = re.search(r"<application\b[^>]*>", read(mf), re.S)
+                  if am:
+                      for _, typ, nm in re.findall(r'android:(icon|roundIcon)="@(mipmap|drawable)/(\w+)"', am.group(0)): names.add(nm)
+              return names
           if icon and os.path.isfile(icon):
               from PIL import Image, ImageDraw
               img = Image.open(icon).convert("RGBA")
               w, h = img.size; m = min(w, h)
               img = img.crop(((w-m)//2, (h-m)//2, (w-m)//2+m, (h-m)//2+m))
               dens = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
-              done = 0
-              manifests = [x for x in glob.glob(f"{tg}/**/AndroidManifest.xml", recursive=True) if "/build/" not in x]
-              for mf in manifests:
-                  mt = read(mf); am = re.search(r"<application\b[^>]*>", mt, re.S)
-                  if not am: continue
-                  refs = re.findall(r'android:(icon|roundIcon)="@(mipmap|drawable)/(\w+)"', am.group(0))
-                  if not refs: continue
-                  res = os.path.join(os.path.dirname(mf), "res")
-                  for kind, typ, name in refs:
-                      for d in glob.glob(f"{tg}/**/res/{typ}*", recursive=True):
-                          for f in glob.glob(os.path.join(d, "*")):
-                              if os.path.splitext(os.path.basename(f))[0] == name and "/build/" not in f: os.remove(f)
-                      for k, sz in dens.items():
-                          d = f"{res}/{typ}-{k}"; os.makedirs(d, exist_ok=True)
-                          sq = img.resize((sz, sz), Image.LANCZOS)
-                          if kind == "roundIcon" or name.endswith("round"):
-                              mask = Image.new("L", (sz, sz), 0); ImageDraw.Draw(mask).ellipse((0, 0, sz-1, sz-1), fill=255)
-                              rd = Image.new("RGBA", (sz, sz), (0, 0, 0, 0)); rd.paste(sq, (0, 0), mask); rd.save(f"{d}/{name}.png")
-                          else:
-                              sq.save(f"{d}/{name}.png")
-                      print(f"[icon] {typ}/{name} replaced in {res}"); done += 1
-              if not done: print("[icon] manifest has no icon refs - icon unchanged")
+              targets = app_icon_names()
+              found = {}   # (res_root, typ, stem) -> [files]
+              for f in glob.glob(f"{tg}/**/res/*/*", recursive=True):
+                  if "/build/" in f: continue
+                  d = os.path.basename(os.path.dirname(f)); stem = os.path.splitext(os.path.basename(f))[0]
+                  typ = "mipmap" if d.startswith("mipmap") else ("drawable" if d.startswith("drawable") else None)
+                  if typ and stem in targets:
+                      found.setdefault((f.split("/res/")[0] + "/res", typ, stem), []).append(f)
+              for (root, typ, stem), files in sorted(found.items()):
+                  for f in files: os.remove(f)
+                  for k, sz in dens.items():
+                      d = f"{root}/{typ}-{k}"; os.makedirs(d, exist_ok=True)
+                      sq = img.resize((sz, sz), Image.LANCZOS)
+                      if stem.endswith("round"):
+                          mask = Image.new("L", (sz, sz), 0); ImageDraw.Draw(mask).ellipse((0, 0, sz-1, sz-1), fill=255)
+                          rd = Image.new("RGBA", (sz, sz), (0, 0, 0, 0)); rd.paste(sq, (0, 0), mask); rd.save(f"{d}/{stem}.png")
+                      else:
+                          sq.save(f"{d}/{stem}.png")
+                  print(f"[icon] {typ}/{stem} replaced in place at {os.path.relpath(root, tg)} ({len(files)} old files)")
+              if not found: print("[icon] no ic_launcher files found - icon unchanged")
           else:
               print("[icon] tiger.jpg not found - icon unchanged")
+
+          # ---------- 5c. sanity: every launcher icon the manifests ask for must still exist ----------
+          have = set()
+          for f in glob.glob(f"{tg}/**/res/*/*", recursive=True):
+              if "/build/" not in f and os.path.basename(os.path.dirname(f)).startswith(("mipmap", "drawable")):
+                  have.add(os.path.splitext(os.path.basename(f))[0])
+          need = set()
+          for mf in glob.glob(f"{tg}/**/AndroidManifest.xml", recursive=True):
+              if "/build/" in mf: continue
+              need |= set(re.findall(r'@(?:mipmap|drawable)/(ic_launcher\w*)', read(mf)))
+          missing = sorted(need - have)
+          if missing: sys.exit("ERROR: icon resources missing after patch: " + ", ".join(missing))
+          print(f"[check] icon resources OK: {sorted(need)}")
 
           # ---------- 6. gradle memory ----------
           gp = os.path.join(tg, "gradle.properties")
@@ -275,7 +294,11 @@ jobs:
           TASK=$(echo "$TASKS" | grep -iE "afat" | head -1)
           if [ -z "$TASK" ]; then TASK=$(echo "$TASKS" | head -1); fi
           echo "BUILDING: $TASK"
-          ./gradlew ":TMessagesProj_App:$TASK" --no-daemon --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          VARIANT="${TASK#assemble}"
+          echo "=== QUICK CHECK (resources + java compile) - fails fast if something is wrong ==="
+          ./gradlew ":TMessagesProj_App:process${VARIANT}Resources" ":TMessagesProj:compileDebugJavaWithJavac" --no-daemon --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          echo "=== QUICK CHECK PASSED - now the full build ==="
+          ./gradlew ":TMessagesProj_App:$TASK" --no-daemon --console=plain 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
           find . -name "*.apk" -path "*outputs*"
 
       - name: Save caches

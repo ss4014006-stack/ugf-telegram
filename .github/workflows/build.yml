@@ -120,7 +120,7 @@ jobs:
           hits = []
           for p in glob.glob(f"{tg}/**/*.java", recursive=True):
               t = read(p)
-              if "AudioRecord" not in t or "UgfGain" in t: continue
+              if "audiorecord" not in t.lower() or "UgfGain" in t: continue
               def rep(m):
                   stmt, var, _, arg = m.groups()
                   hits.append((p, stmt))
@@ -138,27 +138,35 @@ jobs:
               if t2 != t: write(p, t2); cnt += 1
           print(f"[name] {cnt} files renamed to {NAME}")
 
-          # ---------- 5. Icon ----------
+          # ---------- 5. Icon (manifest-driven, exact names only) ----------
           if icon and os.path.isfile(icon):
               from PIL import Image, ImageDraw
               img = Image.open(icon).convert("RGBA")
               w, h = img.size; m = min(w, h)
               img = img.crop(((w-m)//2, (h-m)//2, (w-m)//2+m, (h-m)//2+m))
-              res_dirs = set()
-              for p in glob.glob(f"{tg}/**/res/mipmap-*/ic_launcher*.*", recursive=True) + glob.glob(f"{tg}/**/res/drawable*/ic_launcher*.*", recursive=True):
-                  res_dirs.add(p.split("/res/")[0] + "/res")
-              app_res = [d for d in res_dirs if "TMessagesProj_App" in d]
-              target = (app_res or sorted(res_dirs) or [f"{tg}/TMessagesProj_App/src/main/res"])[0]
-              for d in res_dirs:
-                  for p in glob.glob(f"{d}/mipmap-*/ic_launcher*.*") + glob.glob(f"{d}/drawable*/ic_launcher*.*"):
-                      os.remove(p)
               dens = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
-              for k, sz in dens.items():
-                  d = f"{target}/mipmap-{k}"; os.makedirs(d, exist_ok=True)
-                  sq = img.resize((sz, sz), Image.LANCZOS); sq.save(f"{d}/ic_launcher.png")
-                  mask = Image.new("L", (sz, sz), 0); ImageDraw.Draw(mask).ellipse((0, 0, sz-1, sz-1), fill=255)
-                  rd = Image.new("RGBA", (sz, sz), (0, 0, 0, 0)); rd.paste(sq, (0, 0), mask); rd.save(f"{d}/ic_launcher_round.png")
-              print(f"[icon] tiger icon written to {target}")
+              done = 0
+              manifests = [x for x in glob.glob(f"{tg}/**/AndroidManifest.xml", recursive=True) if "/build/" not in x]
+              for mf in manifests:
+                  mt = read(mf); am = re.search(r"<application\b[^>]*>", mt, re.S)
+                  if not am: continue
+                  refs = re.findall(r'android:(icon|roundIcon)="@(mipmap|drawable)/(\w+)"', am.group(0))
+                  if not refs: continue
+                  res = os.path.join(os.path.dirname(mf), "res")
+                  for kind, typ, name in refs:
+                      for d in glob.glob(f"{tg}/**/res/{typ}*", recursive=True):
+                          for f in glob.glob(os.path.join(d, "*")):
+                              if os.path.splitext(os.path.basename(f))[0] == name and "/build/" not in f: os.remove(f)
+                      for k, sz in dens.items():
+                          d = f"{res}/{typ}-{k}"; os.makedirs(d, exist_ok=True)
+                          sq = img.resize((sz, sz), Image.LANCZOS)
+                          if kind == "roundIcon" or name.endswith("round"):
+                              mask = Image.new("L", (sz, sz), 0); ImageDraw.Draw(mask).ellipse((0, 0, sz-1, sz-1), fill=255)
+                              rd = Image.new("RGBA", (sz, sz), (0, 0, 0, 0)); rd.paste(sq, (0, 0), mask); rd.save(f"{d}/{name}.png")
+                          else:
+                              sq.save(f"{d}/{name}.png")
+                      print(f"[icon] {typ}/{name} replaced in {res}"); done += 1
+              if not done: print("[icon] manifest has no icon refs - icon unchanged")
           else:
               print("[icon] tiger.jpg not found - icon unchanged")
 
@@ -167,7 +175,64 @@ jobs:
           t = read(gp) if os.path.exists(gp) else ""
           t = re.sub(r"(?m)^org\.gradle\.jvmargs=.*$\n?", "", t)
           write(gp, t.rstrip("\n") + "\norg.gradle.jvmargs=-Xmx5g -Dfile.encoding=UTF-8\norg.gradle.daemon=false\n")
-          print("[done] patch complete")
+
+          # ---------- 7. aapt2 fix: multiple non-positional format args ----------
+          SPEC = re.compile(r"%(?:(\d+)\$)?[-#+0,(]*\d*(?:\.\d+)?[sdfxXeEgGcb]")
+          fixed = {"renum": 0, "mixed": 0}
+          def renum(text):
+              t = text.replace("%%", "\0\0")
+              specs = list(SPEC.finditer(t))
+              nonpos = [m for m in specs if not m.group(1)]
+              if len(nonpos) < 2: return None
+              if len(nonpos) != len(specs): return "mixed"
+              out, last = [], 0
+              for i, m in enumerate(specs, 1):
+                  out.append(t[last:m.start()]); out.append("%" + str(i) + "$" + m.group(0)[1:]); last = m.end()
+              out.append(t[last:])
+              return "".join(out).replace("\0\0", "%%")
+          def fix_string(m):
+              head, body, tail = m.groups()
+              if "formatted=" in head: return m.group(0)
+              r = renum(body)
+              if r is None: return m.group(0)
+              if r == "mixed":
+                  fixed["mixed"] += 1
+                  return head[:-1] + ' formatted="false">' + body + tail
+              fixed["renum"] += 1
+              return head + r + tail
+          def fix_item(m):
+              head, body, tail = m.groups()
+              r = renum(body)
+              if r is None or r == "mixed": return m.group(0)
+              fixed["renum"] += 1
+              return head + r + tail
+          RS = re.compile(r"(<string\b[^>]*?(?<!/)>)(.*?)(</string>)", re.S)
+          RI = re.compile(r"(<item\b[^>]*?(?<!/)>)(.*?)(</item>)", re.S)
+          nfiles = 0
+          for p in glob.glob(f"{tg}/**/src/main/res/values*/*.xml", recursive=True):
+              t = read(p)
+              if "%" not in t: continue
+              t2 = RI.sub(fix_item, RS.sub(fix_string, t))
+              if t2 != t: write(p, t2); nfiles += 1
+          print(f"[aapt2] fixed {fixed['renum']} strings (renumbered), {fixed['mixed']} marked formatted=false, in {nfiles} files")
+
+          # ---------- 8. only arm64 (faster build, fits all modern phones) ----------
+          LST = r'["\'][\w-]+["\'](?:\s*,\s*["\'][\w-]+["\'])*'
+          abi_re = re.compile(r'(\babiFilters\b\s*(?:=\s*)?)(' + LST + r')')
+          inc_re = re.compile(r'(\binclude\s+)(' + LST + r')')
+          cnt_abi = 0
+          for p in glob.glob(f"{tg}/**/*.gradle", recursive=True):
+              if "/build/" in p: continue
+              t = read(p); out = []
+              for l in t.split("\n"):
+                  l2 = abi_re.sub(lambda m: m.group(1) + '"arm64-v8a"' if "arm" in m.group(2) else m.group(0), l)
+                  if "arm" in l2 and "v7a" in l2: l2 = inc_re.sub(lambda m: m.group(1) + '"arm64-v8a"' if "arm" in m.group(2) else m.group(0), l2)
+                  if l2 != l: cnt_abi += 1; print(f"[abi] {os.path.relpath(p, tg)}: {l.strip()[:90]} -> {l2.strip()[:90]}")
+                  out.append(l2)
+              t2 = "\n".join(out)
+              if t2 != t: write(p, t2)
+          print(f"[abi] {cnt_abi} lines restricted to arm64-v8a")
+          print("[done] all patches complete")
           PYEOF
           (python3 -c "import PIL" 2>/dev/null || (sudo apt-get update -qq; sudo apt-get install -y python3-pil)) && python3 /tmp/patch.py tg "${{ github.event.inputs.mic_gain }}" "$GITHUB_WORKSPACE/tiger.jpg"
 
@@ -179,16 +244,60 @@ jobs:
           if [ -n "$NDK" ]; then sdkmanager "ndk;$NDK" || true; fi
           sdkmanager "cmake;3.22.1" || true
 
+      - name: Setup ccache (reuse C++ compile on retries)
+        run: |
+          sudo apt-get install -y ccache >/dev/null 2>&1 && {
+            echo "CMAKE_C_COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
+            echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+            echo "CCACHE_MAXSIZE=3G" >> "$GITHUB_ENV"
+            echo "ccache enabled"
+          } || echo "ccache not available, continuing without"
+
+      - name: Restore caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.ccache
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ugf-cache-${{ github.run_id }}
+          restore-keys: |
+            ugf-cache-
+
       - name: Build APK
+        shell: bash
         working-directory: tg
         run: |
           chmod +x gradlew
-          ./gradlew :TMessagesProj_App:tasks --all --no-daemon -q | grep -iE "^assemble" | head -30 || true
-          TASK=$(./gradlew :TMessagesProj_App:tasks --all --no-daemon -q | grep -oiE "^assemble[A-Za-z0-9_]*Debug" | grep -iE "afat" | head -1 || true)
-          if [ -z "$TASK" ]; then TASK=$(./gradlew :TMessagesProj_App:tasks --all --no-daemon -q | grep -oiE "^assemble[A-Za-z0-9_]*Debug" | head -1); fi
+          TASKS=$(./gradlew :TMessagesProj_App:tasks --all --no-daemon -q 2>/dev/null | grep -oiE "^assemble[A-Za-z0-9_]*Debug" || true)
+          echo "$TASKS"
+          TASK=$(echo "$TASKS" | grep -iE "afat" | head -1)
+          if [ -z "$TASK" ]; then TASK=$(echo "$TASKS" | head -1); fi
           echo "BUILDING: $TASK"
-          ./gradlew ":TMessagesProj_App:$TASK" --no-daemon --stacktrace
+          ./gradlew ":TMessagesProj_App:$TASK" --no-daemon --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
           find . -name "*.apk" -path "*outputs*"
+
+      - name: Save caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.ccache
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ugf-cache-${{ github.run_id }}
+
+      - name: Short error summary (also on Summary page)
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "## SHORT ERROR SUMMARY"
+            echo '```'
+            grep -n -E "What went wrong|error:|Execution failed|Could not|AAPT|cannot find symbol|incompatible types|FAILED" build.log | grep -v -i "warning" | cut -c1-230 | head -40 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Collect APK
         run: |

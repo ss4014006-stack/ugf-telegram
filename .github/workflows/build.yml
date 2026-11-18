@@ -2,10 +2,6 @@ name: Build UI Fighter Telegram
 
 on:
   workflow_dispatch:
-    inputs:
-      mic_gain:
-        description: "Mic gain multiplier (1 = normal, 4 = loud, 10 = very loud)"
-        default: "4"
 
 permissions:
   contents: write
@@ -42,10 +38,10 @@ jobs:
         run: |
           cat > /tmp/patch.py <<'PYEOF'
           #!/usr/bin/env python3
-          """UI FIGHTER patcher for DrKLO/Telegram source. Usage: patch.py <tg_dir> <gain> <icon_path_or_empty>"""
+          """UI FIGHTER patcher for DrKLO/Telegram source. Usage: patch.py <tg_dir> <unused> <icon_path_or_empty>"""
           import os, re, sys, glob
 
-          tg, gain, icon = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+          tg, icon = sys.argv[1], sys.argv[3]   # argv[2] unused (kept for compatibility)
           app_id, app_hash = os.environ.get("TG_API_ID", ""), os.environ.get("TG_API_HASH", "")
           NAME = "UI Fighter"
 
@@ -65,66 +61,599 @@ jobs:
           write(bv[0], s)
           print(f"[keys] BuildVars patched ({n1},{n2})")
 
-          # ---------- 2. Gain class ----------
-          java = '''package org.telegram.messenger;
+          # ---------- 2. Mixer + DSP classes ----------
+          JAVA_GAIN = r'''package org.telegram.messenger;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.media.AudioFormat;
+          import android.media.AudioRecord;
 
           import java.nio.ByteBuffer;
           import java.nio.ByteOrder;
+          import java.util.concurrent.ConcurrentHashMap;
 
-          /** UI FIGHTER mic amplifier: gain + soft limiter (tanh). Never throws. */
+          /**
+           * UI FIGHTER voice amplifier. Java port of the extension's WebAudio chain:
+           * HPF -> body -> mic gain -> bass/sharpness/treble EQ -> volume -> adaptive leveler
+           * -> dual exciter -> soft clip -> compressor -> limiter -> final limiter (+ echo).
+           * Never throws into the audio thread.
+           */
           public class UgfGain {
-              public static final float GAIN = %sf;
+              public static final String PREFS = "ugf_mixer";
+              public static final String[] KEYS = {"volume", "micGain", "bass", "treble", "sharpness", "noiseGate", "echo", "compression", "limiter"};
+              public static final int[] DEF = {3000, 2500, 250, 500, 500, 0, 15, 55, 80};
+              public static final int[] MIN = {1, 0, 0, 0, 0, 0, 0, 0, 0};
+              public static final int[] MAX = {9000, 9000, 9000, 9000, 9000, 100, 100, 100, 100};
 
-              private static short amp(short s) {
-                  float x = (s / 32768f) * GAIN;
-                  return (short) (Math.tanh(x) * 32000f);
+              static final class Params {
+                  final int[] v = new int[9];
+                  boolean power = true;
               }
 
-              public static void process(ByteBuffer buf, int bytes) {
+              private static volatile Params params;
+              private static volatile boolean dirty = true;
+              private static volatile long lastLoad;
+              private static final ConcurrentHashMap<Integer, Engine> engines = new ConcurrentHashMap<Integer, Engine>();
+
+              public static void reload() {
+                  dirty = true;
+              }
+
+              private static int clampI(int x, int lo, int hi) {
+                  return x < lo ? lo : (x > hi ? hi : x);
+              }
+
+              private static Params current() {
+                  long now = System.nanoTime();
+                  Params p = params;
+                  if (p != null && !dirty && now - lastLoad < 300000000L) return p;
+                  Params np = new Params();
+                  for (int i = 0; i < 9; i++) np.v[i] = DEF[i];
+                  try {
+                      Context c = ApplicationLoader.applicationContext;
+                      if (c != null) {
+                          SharedPreferences sp = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+                          for (int i = 0; i < 9; i++) np.v[i] = clampI(sp.getInt(KEYS[i], DEF[i]), MIN[i], MAX[i]);
+                          np.power = sp.getBoolean("power", true);
+                      }
+                  } catch (Throwable ignore) {
+                  }
+                  params = np;
+                  dirty = false;
+                  lastLoad = now;
+                  return np;
+              }
+
+              private static Engine engineFor(Object recv) {
+                  Integer key = Integer.valueOf(System.identityHashCode(recv));
+                  Engine e = engines.get(key);
+                  if (e == null) {
+                      if (engines.size() > 6) engines.clear();
+                      e = new Engine();
+                      engines.put(key, e);
+                  }
+                  return e;
+              }
+
+              // ---------------- public hooks (called right after AudioRecord.read) ----------------
+
+              public static void process(ByteBuffer buf, int bytes, Object recv) {
                   try {
                       if (buf == null || bytes < 2) return;
+                      int rate = 48000, ch = 1;
+                      if (recv instanceof AudioRecord) {
+                          AudioRecord ar = (AudioRecord) recv;
+                          if (ar.getAudioFormat() != AudioFormat.ENCODING_PCM_16BIT) return;
+                          rate = ar.getSampleRate();
+                          ch = ar.getChannelCount();
+                      }
+                      Params p = current();
+                      if (!p.power) return;
+                      int n = Math.min(bytes, buf.capacity()) & ~1;
+                      int samples = n / 2;
+                      Engine e = engineFor(recv);
+                      short[] tmp = e.scratch(samples);
                       ByteBuffer b = buf.duplicate().order(ByteOrder.LITTLE_ENDIAN);
-                      int n = Math.min(bytes, b.capacity()) & ~1;
-                      for (int i = 0; i < n; i += 2) b.putShort(i, amp(b.getShort(i)));
-                  } catch (Throwable ignore) {}
+                      for (int i = 0; i < samples; i++) tmp[i] = b.getShort(i * 2);
+                      e.run(tmp, samples, ch, rate, p);
+                      for (int i = 0; i < samples; i++) b.putShort(i * 2, tmp[i]);
+                  } catch (Throwable ignore) {
+                  }
               }
 
-              public static void process(byte[] a, int bytes) {
+              public static void process(byte[] a, int bytes, Object recv) {
                   try {
                       if (a == null || bytes < 2) return;
-                      int n = Math.min(bytes, a.length) & ~1;
-                      for (int i = 0; i < n; i += 2) {
-                          short s = (short) ((a[i] & 0xff) | (a[i + 1] << 8));
-                          s = amp(s);
-                          a[i] = (byte) (s & 0xff);
-                          a[i + 1] = (byte) ((s >> 8) & 0xff);
+                      int rate = 48000, ch = 1;
+                      if (recv instanceof AudioRecord) {
+                          AudioRecord ar = (AudioRecord) recv;
+                          if (ar.getAudioFormat() != AudioFormat.ENCODING_PCM_16BIT) return;
+                          rate = ar.getSampleRate();
+                          ch = ar.getChannelCount();
                       }
-                  } catch (Throwable ignore) {}
+                      Params p = current();
+                      if (!p.power) return;
+                      int n = Math.min(bytes, a.length) & ~1;
+                      int samples = n / 2;
+                      Engine e = engineFor(recv);
+                      short[] tmp = e.scratch(samples);
+                      for (int i = 0; i < samples; i++) tmp[i] = (short) ((a[2 * i] & 0xff) | (a[2 * i + 1] << 8));
+                      e.run(tmp, samples, ch, rate, p);
+                      for (int i = 0; i < samples; i++) {
+                          a[2 * i] = (byte) (tmp[i] & 0xff);
+                          a[2 * i + 1] = (byte) ((tmp[i] >> 8) & 0xff);
+                      }
+                  } catch (Throwable ignore) {
+                  }
               }
 
-              public static void process(short[] a, int samples) {
+              public static void process(short[] a, int samples, Object recv) {
                   try {
                       if (a == null || samples < 1) return;
-                      int n = Math.min(samples, a.length);
-                      for (int i = 0; i < n; i++) a[i] = amp(a[i]);
-                  } catch (Throwable ignore) {}
+                      int rate = 48000, ch = 1;
+                      if (recv instanceof AudioRecord) {
+                          AudioRecord ar = (AudioRecord) recv;
+                          if (ar.getAudioFormat() != AudioFormat.ENCODING_PCM_16BIT) return;
+                          rate = ar.getSampleRate();
+                          ch = ar.getChannelCount();
+                      }
+                      Params p = current();
+                      if (!p.power) return;
+                      engineFor(recv).run(a, Math.min(samples, a.length), ch, rate, p);
+                  } catch (Throwable ignore) {
+                  }
+              }
+
+              // ---------------- DSP building blocks ----------------
+
+              static final class Biquad {
+                  float b0 = 1, b1, b2, a1, a2, z1, z2;
+
+                  float run(float x) {
+                      float y = b0 * x + z1;
+                      z1 = b1 * x - a1 * y + z2;
+                      z2 = b2 * x - a2 * y;
+                      return y;
+                  }
+
+                  private void set(double nb0, double nb1, double nb2, double na0, double na1, double na2) {
+                      b0 = (float) (nb0 / na0);
+                      b1 = (float) (nb1 / na0);
+                      b2 = (float) (nb2 / na0);
+                      a1 = (float) (na1 / na0);
+                      a2 = (float) (na2 / na0);
+                  }
+
+                  // WebAudio low/high-pass use Q in dB.
+                  void lowpass(double fs, double f, double qDb) {
+                      double w0 = 2 * Math.PI * f / fs, c = Math.cos(w0), al = Math.sin(w0) / (2 * Math.pow(10, qDb / 20));
+                      set((1 - c) / 2, 1 - c, (1 - c) / 2, 1 + al, -2 * c, 1 - al);
+                  }
+
+                  void highpass(double fs, double f, double qDb) {
+                      double w0 = 2 * Math.PI * f / fs, c = Math.cos(w0), al = Math.sin(w0) / (2 * Math.pow(10, qDb / 20));
+                      set((1 + c) / 2, -(1 + c), (1 + c) / 2, 1 + al, -2 * c, 1 - al);
+                  }
+
+                  void peaking(double fs, double f, double q, double db) {
+                      double A = Math.pow(10, db / 40), w0 = 2 * Math.PI * f / fs, c = Math.cos(w0), al = Math.sin(w0) / (2 * q);
+                      set(1 + al * A, -2 * c, 1 - al * A, 1 + al / A, -2 * c, 1 - al / A);
+                  }
+
+                  void lowshelf(double fs, double f, double db) {
+                      double A = Math.pow(10, db / 40), w0 = 2 * Math.PI * f / fs, c = Math.cos(w0);
+                      double al = Math.sin(w0) / 2 * Math.sqrt(2), sa = 2 * Math.sqrt(A) * al;
+                      set(A * ((A + 1) - (A - 1) * c + sa), 2 * A * ((A - 1) - (A + 1) * c), A * ((A + 1) - (A - 1) * c - sa),
+                              (A + 1) + (A - 1) * c + sa, -2 * ((A - 1) + (A + 1) * c), (A + 1) + (A - 1) * c - sa);
+                  }
+
+                  void highshelf(double fs, double f, double db) {
+                      double A = Math.pow(10, db / 40), w0 = 2 * Math.PI * f / fs, c = Math.cos(w0);
+                      double al = Math.sin(w0) / 2 * Math.sqrt(2), sa = 2 * Math.sqrt(A) * al;
+                      set(A * ((A + 1) + (A - 1) * c + sa), -2 * A * ((A - 1) + (A + 1) * c), A * ((A + 1) + (A - 1) * c - sa),
+                              (A + 1) - (A - 1) * c + sa, 2 * ((A - 1) - (A + 1) * c), (A + 1) - (A - 1) * c - sa);
+                  }
+              }
+
+              /** Feed-forward compressor, dB domain, soft knee, WebAudio-like automatic makeup gain. */
+              static final class Comp {
+                  float thr, knee, ratio, makeup = 1, atk, rel, grDb;
+
+                  void set(float thrDb, float kneeDb, float r, float attackS, float releaseS, float fs) {
+                      thr = thrDb;
+                      knee = kneeDb;
+                      ratio = r < 1 ? 1 : r;
+                      atk = (float) Math.exp(-1.0 / (attackS * fs));
+                      rel = (float) Math.exp(-1.0 / (releaseS * fs));
+                      float g0 = gain(0f);
+                      makeup = (float) Math.exp(-0.6 * g0 * 0.11512925);
+                  }
+
+                  float gain(float lv) {
+                      float half = knee * 0.5f;
+                      if (lv < thr - half) return 0f;
+                      if (knee > 0f && lv <= thr + half) {
+                          float d = lv - thr + half;
+                          return ((1f / ratio) - 1f) * d * d / (2f * knee);
+                      }
+                      return thr + (lv - thr) / ratio - lv;
+                  }
+
+                  float run(float x) {
+                      float a = x < 0 ? -x : x;
+                      float lv = a < 1e-6f ? -120f : (float) Math.log(a) * 8.685889f;
+                      float g = gain(lv);
+                      float c = g < grDb ? atk : rel;
+                      grDb = c * grDb + (1f - c) * g;
+                      return x * (float) Math.exp(grDb * 0.11512925f) * makeup;
+                  }
+              }
+
+              static final class Chan {
+                  final Biquad hpf = new Biquad(), body = new Biquad(), bass = new Biquad(), sharp = new Biquad(), treble = new Biquad(),
+                          bassTap = new Biquad(), trebleTap = new Biquad();
+                  final Comp comp = new Comp(), lim = new Comp();
+                  float lev = 1.2f, rmsEnv = 0f;
+                  float[] echo;
+                  int echoW = 0;
+              }
+
+              static final class Engine {
+                  Chan[] chans;
+                  int rate;
+                  Params lastP;
+                  short[] tmp = new short[0];
+                  float micF, volRaw, wet, fb, gateThr;
+                  int delaySamples = 1;
+
+                  short[] scratch(int n) {
+                      if (tmp.length < n) tmp = new short[n + 1024];
+                      return tmp;
+                  }
+
+                  private static float clampF(float x, float lo, float hi) {
+                      return x < lo ? lo : (x > hi ? hi : x);
+                  }
+
+                  private void configure(Params p, int fs, int ch) {
+                      if (chans == null || chans.length != ch || rate != fs) {
+                          chans = new Chan[ch];
+                          for (int c = 0; c < ch; c++) {
+                              chans[c] = new Chan();
+                              chans[c].echo = new float[(int) (0.62f * fs) + 8];
+                          }
+                          rate = fs;
+                      }
+                      float vol = p.v[0], mic = p.v[1];
+                      micF = 1f + (mic / 2000f) * 6f;
+                      volRaw = (0.35f + (vol / 2400f) * 4.65f) * (2.4f * 8.0f);
+                      float bassDb = -12f + (p.v[2] / 4000f) * 30f;
+                      float trebDb = -12f + (p.v[3] / 4000f) * 30f;
+                      float sharpDb = -12f + (p.v[4] / 4000f) * 30f;
+                      gateThr = clampF(p.v[5], 0, 100) / 500f * 0.08f;
+                      float echoV = clampF(p.v[6], 0, 100);
+                      wet = echoV == 0 ? 0f : echoV / 500f * 0.42f;
+                      fb = echoV == 0 ? 0f : 0.10f + echoV / 500f * 0.30f;
+                      float delayS = 0.10f + echoV / 500f * 0.30f;
+                      delaySamples = Math.max(1, Math.min((int) (delayS * fs), (int) (0.6f * fs)));
+                      float cmp = clampF(p.v[7], 0, 100), lmt = clampF(p.v[8], 0, 100);
+                      float cThr = cmp == 0 ? 0f : -6f - cmp * 0.54f;
+                      float cRatio = cmp == 0 ? 1f : 1f + cmp * 0.19f;
+                      float lThr = lmt == 0 ? 0f : -1f - lmt * 0.24f;
+                      for (int c = 0; c < ch; c++) {
+                          Chan k = chans[c];
+                          k.hpf.highpass(fs, 40, 0.707);
+                          k.body.peaking(fs, 400, 0.707, 3);
+                          k.bass.lowshelf(fs, 180, bassDb);
+                          k.sharp.peaking(fs, 2800, 0.9, sharpDb);
+                          k.treble.highshelf(fs, 5500, trebDb);
+                          k.bassTap.lowpass(fs, 300, 0.707);
+                          k.trebleTap.highpass(fs, 3000, 0.707);
+                          k.comp.set(cThr, 24f, cRatio, 0.003f, 0.18f, fs);
+                          k.lim.set(lThr, 0f, 20f, 0.001f, 0.08f, fs);
+                      }
+                      lastP = p;
+                  }
+
+                  void run(short[] s, int total, int ch, int fs, Params p) {
+                      if (ch < 1 || ch > 2 || fs < 8000) return;
+                      int frames = total / ch;
+                      if (frames <= 0) return;
+                      if (lastP != p || chans == null || chans.length != ch || rate != fs) configure(p, fs, ch);
+                      final float inv = 1f / 32768f;
+                      final float dt = frames / (float) fs;
+                      for (int c = 0; c < ch; c++) {
+                          Chan k = chans[c];
+                          // ---- adaptive speech leveler (target RMS .68, 1x..20x, 75ms attack, 240ms release) ----
+                          double sum = 0;
+                          float peak = 0;
+                          for (int i = 0; i < frames; i++) {
+                              float x = s[i * ch + c] * inv;
+                              sum += x * x;
+                              float a = x < 0 ? -x : x;
+                              if (a > peak) peak = a;
+                          }
+                          float rms = (float) Math.sqrt(sum / frames);
+                          float envCoeff = (float) Math.exp(-dt / 0.06f);
+                          k.rmsEnv = envCoeff * k.rmsEnv + (1f - envCoeff) * rms;
+                          float desired = 1f;
+                          if (k.rmsEnv > 1e-5f) desired = clampF(0.68f / k.rmsEnv, 1f, 20f);
+                          if (gateThr > 0f && peak < gateThr && k.rmsEnv < gateThr) desired = 0f;
+                          float tc = desired > k.lev ? 0.075f : 0.24f;
+                          float coeff = (float) Math.exp(-dt / tc);
+                          float gStart = k.lev;
+                          k.lev = coeff * k.lev + (1f - coeff) * desired;
+                          float g = gStart, gStep = (k.lev - gStart) / frames;
+
+                          for (int i = 0; i < frames; i++) {
+                              int idx = i * ch + c;
+                              float x = s[idx] * inv;
+                              x = k.hpf.run(x);
+                              x = k.body.run(x);
+                              x *= micF;
+                              x = k.bass.run(x);
+                              x = k.sharp.run(x);
+                              x = k.treble.run(x);
+                              x *= volRaw;
+                              x *= g;
+                              g += gStep;
+                              float lev = x;
+                              // dual exciter (inputs of WaveShaper nodes are clamped to [-1,1])
+                              float bt = clampF(k.bassTap.run(lev), -1f, 1f);
+                              float be = (bt < 0 ? -1f : 1f) * (float) Math.pow(bt < 0 ? -bt : bt, 0.75) * 0.06f;
+                              float tt = clampF(k.trebleTap.run(lev), -1f, 1f);
+                              float te = (float) Math.tanh(tt * 2.0) * 0.12f;
+                              float bus = lev * 0.78f + lev * 0.22f + be + te;
+                              float sc = (float) Math.tanh(clampF(bus, -1f, 1f) * 1.05) * 0.95f;
+                              float cx = k.comp.run(sc);
+                              float lx = k.lim.run(cx);
+                              float fin = (float) Math.tanh(clampF(lx, -1f, 1f) * 10.0) * 0.995f;
+                              float out = fin;
+                              if (wet > 0f) {
+                                  int rp = k.echoW - delaySamples;
+                                  if (rp < 0) rp += k.echo.length;
+                                  float d = k.echo[rp];
+                                  k.echo[k.echoW] = fin + fb * d;
+                                  if (++k.echoW >= k.echo.length) k.echoW = 0;
+                                  out = fin + wet * d;
+                              }
+                              int o = (int) (out * 32767f);
+                              s[idx] = (short) (o > 32767 ? 32767 : (o < -32768 ? -32768 : o));
+                          }
+                      }
+                  }
               }
           }
-          ''' % repr(gain)
+          '''
+
+          JAVA_MIXER = r'''package org.telegram.messenger;
+
+          import android.app.Activity;
+          import android.content.SharedPreferences;
+          import android.graphics.Typeface;
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.CompoundButton;
+          import android.widget.ImageView;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.Switch;
+          import android.widget.TextView;
+
+          /** UI FIGHTER mixer screen: same controls as the extension popup. Changes apply live. */
+          public class UgfMixerActivity extends Activity {
+              private static final String[] LABELS = {"MASTER VOLUME", "MIC AMPLIFIER", "BASS", "TREBLE", "SHARPNESS", "NOISE GATE (OPTIONAL)", "ECHO", "COMPRESSOR", "LIMITER"};
+              private static final int[] P1 = {5500, 5000, 2500, 3000, 3000, 0, 8, 45, 70};
+              private static final int[] P2 = {7500, 7000, 5000, 5500, 5500, 5, 15, 65, 82};
+              private static final int[] P3 = {9000, 9000, 9000, 9000, 9000, 8, 25, 80, 90};
+
+              private SharedPreferences sp;
+              private float density = 1f;
+              private final SeekBar[] bars = new SeekBar[9];
+              private final TextView[] vals = new TextView[9];
+              private boolean busy = false;
+
+              private int dp(int v) {
+                  return (int) (v * density + 0.5f);
+              }
+
+              private TextView text(String s, int sizeSp, int color, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(sizeSp);
+                  t.setTextColor(color);
+                  if (bold) t.setTypeface(null, Typeface.BOLD);
+                  return t;
+              }
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  density = getResources().getDisplayMetrics().density;
+                  sp = getSharedPreferences(UgfGain.PREFS, MODE_PRIVATE);
+
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.setBackgroundColor(0xFF0B0A12);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(16), dp(28), dp(16), dp(40));
+                  scroll.addView(root, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+                  // header
+                  LinearLayout head = new LinearLayout(this);
+                  head.setOrientation(LinearLayout.HORIZONTAL);
+                  head.setGravity(Gravity.CENTER_VERTICAL);
+                  try {
+                      ImageView logo = new ImageView(this);
+                      logo.setImageResource(getApplicationInfo().icon);
+                      head.addView(logo, new LinearLayout.LayoutParams(dp(56), dp(56)));
+                  } catch (Throwable ignore) {
+                  }
+                  LinearLayout titles = new LinearLayout(this);
+                  titles.setOrientation(LinearLayout.VERTICAL);
+                  titles.setPadding(dp(12), 0, 0, 0);
+                  titles.addView(text("UI GOD FATHER SUMIT V3", 18, 0xFFF2E8FF, true));
+                  titles.addView(text("AUDIO AMPLIFIER ENGINE", 11, 0xFFB57CFF, false));
+                  head.addView(titles);
+                  root.addView(head);
+
+                  // power
+                  Switch power = new Switch(this);
+                  power.setText("UI FIGHTER AUDIO ON  (off = clean mic)");
+                  power.setTextColor(0xFFFFFFFF);
+                  power.setChecked(sp.getBoolean("power", true));
+                  power.setPadding(0, dp(18), 0, dp(6));
+                  power.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+                      @Override
+                      public void onCheckedChanged(CompoundButton b, boolean checked) {
+                          sp.edit().putBoolean("power", checked).apply();
+                          UgfGain.reload();
+                      }
+                  });
+                  root.addView(power);
+
+                  root.addView(text("Changes apply live. Set it here, then go back to Telegram: voice chat, voice notes and video messages all use this mixer.", 12, 0xFF9A93B5, false));
+
+                  // presets
+                  LinearLayout presets = new LinearLayout(this);
+                  presets.setOrientation(LinearLayout.HORIZONTAL);
+                  presets.setPadding(0, dp(14), 0, dp(6));
+                  presets.addView(presetButton("FULL POWER", P1), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                  presets.addView(presetButton("NUCLEAR", P2), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                  presets.addView(presetButton("GODMODE", P3), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                  root.addView(presets);
+
+                  // sliders
+                  for (int i = 0; i < 9; i++) {
+                      final int idx = i;
+                      final int min = UgfGain.MIN[i];
+                      TextView label = text(LABELS[i], 12, 0xFFDCA8FF, true);
+                      label.setPadding(0, dp(16), 0, 0);
+                      root.addView(label);
+                      vals[i] = text("", 13, 0xFFFFFFFF, true);
+                      root.addView(vals[i]);
+                      SeekBar bar = new SeekBar(this);
+                      bar.setMax(UgfGain.MAX[i] - min);
+                      int cur = sp.getInt(UgfGain.KEYS[i], UgfGain.DEF[i]);
+                      if (cur < min) cur = min;
+                      if (cur > UgfGain.MAX[i]) cur = UgfGain.MAX[i];
+                      bar.setProgress(cur - min);
+                      vals[i].setText(String.valueOf(cur));
+                      bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                          @Override
+                          public void onProgressChanged(SeekBar s, int progress, boolean fromUser) {
+                              int v = progress + min;
+                              vals[idx].setText(String.valueOf(v));
+                              if (!busy) {
+                                  sp.edit().putInt(UgfGain.KEYS[idx], v).apply();
+                                  UgfGain.reload();
+                              }
+                          }
+
+                          @Override
+                          public void onStartTrackingTouch(SeekBar s) {
+                          }
+
+                          @Override
+                          public void onStopTrackingTouch(SeekBar s) {
+                          }
+                      });
+                      bars[i] = bar;
+                      root.addView(bar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                  }
+
+                  Button reset = new Button(this);
+                  reset.setText("RESET ALL SETTINGS");
+                  reset.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          applyPreset(UgfGain.DEF);
+                      }
+                  });
+                  LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  rp.setMargins(0, dp(24), 0, 0);
+                  root.addView(reset, rp);
+
+                  setContentView(scroll);
+              }
+
+              private Button presetButton(String name, final int[] values) {
+                  Button b = new Button(this);
+                  b.setText(name);
+                  b.setTextSize(11);
+                  b.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          applyPreset(values);
+                      }
+                  });
+                  return b;
+              }
+
+              private void applyPreset(int[] values) {
+                  busy = true;
+                  SharedPreferences.Editor e = sp.edit();
+                  for (int i = 0; i < 9; i++) {
+                      e.putInt(UgfGain.KEYS[i], values[i]);
+                      bars[i].setProgress(values[i] - UgfGain.MIN[i]);
+                      vals[i].setText(String.valueOf(values[i]));
+                  }
+                  e.apply();
+                  busy = false;
+                  UgfGain.reload();
+              }
+          }
+          '''
+
           src_roots = glob.glob(f"{tg}/TMessagesProj/src/main/java/org/telegram/messenger")
           if not src_roots: sys.exit("ERROR: org/telegram/messenger dir not found")
-          write(os.path.join(src_roots[0], "UgfGain.java"), java)
+          write(os.path.join(src_roots[0], "UgfGain.java"), JAVA_GAIN)
+          write(os.path.join(src_roots[0], "UgfMixerActivity.java"), JAVA_MIXER)
+          print("[dsp] UgfGain.java + UgfMixerActivity.java written")
+
+          # register the mixer screen as its own launcher icon
+          ACT = """
+                  <activity android:name="org.telegram.messenger.UgfMixerActivity"
+                      android:exported="true"
+                      android:label="UI Fighter Mixer"
+                      android:icon="@mipmap/ic_launcher"
+                      android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+          """
+          mfs = [m for m in glob.glob(f"{tg}/**/AndroidManifest.xml", recursive=True) if "/build/" not in m]
+          pref = [m for m in mfs if m.endswith("TMessagesProj/src/main/AndroidManifest.xml")] + mfs
+          placed = None
+          for mf in pref:
+              t = read(mf)
+              if "</application>" in t and "<application" in t:
+                  if "UgfMixerActivity" not in t:
+                      i = t.rindex("</application>")
+                      write(mf, t[:i] + ACT + "    " + t[i:])
+                  placed = mf
+                  break
+          if not placed: sys.exit("ERROR: no AndroidManifest.xml with <application> found")
+          print(f"[mixer] launcher activity registered in {os.path.relpath(placed, tg)}")
 
           # ---------- 3. Hook every AudioRecord.read(...) ----------
-          pat = re.compile(r"((?:int\s+)?(\w+)\s*=\s*(\w*(?:[aA]udioRecord|recorder)\w*)\.read\(\s*([A-Za-z_][\w\.]*)\s*,[^;]*;)")
+          pat = re.compile(r"((?:int\s+)?(\w+)\s*=\s*(\w*[aA]udioRecord\w*)\.read\(\s*([A-Za-z_][\w\.]*)\s*,[^;]*;)")
           hits = []
           for p in glob.glob(f"{tg}/**/*.java", recursive=True):
               t = read(p)
               if "audiorecord" not in t.lower() or "UgfGain" in t: continue
               def rep(m):
-                  stmt, var, _, arg = m.groups()
+                  stmt, var, recv, arg = m.groups()
                   hits.append((p, stmt))
-                  return f"{stmt} if ({var} > 0) org.telegram.messenger.UgfGain.process({arg}, {var});"
+                  return f"{stmt} if ({var} > 0) org.telegram.messenger.UgfGain.process({arg}, {var}, {recv});"
               t2 = pat.sub(rep, t)
               if t2 != t: write(p, t2)
           for p, l in hits: print(f"[hook] {os.path.relpath(p, tg)} :: {l}")
@@ -253,7 +782,7 @@ jobs:
           print(f"[abi] {cnt_abi} lines restricted to arm64-v8a")
           print("[done] all patches complete")
           PYEOF
-          (python3 -c "import PIL" 2>/dev/null || (sudo apt-get update -qq; sudo apt-get install -y python3-pil)) && python3 /tmp/patch.py tg "${{ github.event.inputs.mic_gain }}" "$GITHUB_WORKSPACE/tiger.jpg"
+          (python3 -c "import PIL" 2>/dev/null || (sudo apt-get update -qq; sudo apt-get install -y python3-pil)) && python3 /tmp/patch.py tg 1 "$GITHUB_WORKSPACE/tiger.jpg"
 
       - name: Install Android NDK / SDK pieces
         run: |
@@ -341,4 +870,4 @@ jobs:
         run: |
           gh release create "ugf-${{ github.run_number }}" out/UI-Fighter-Telegram.apk \
             --title "UI Fighter build ${{ github.run_number }}" \
-            --notes "Official Telegram source + UI Fighter mic boost (gain ${{ github.event.inputs.mic_gain }})"
+            --notes "Official Telegram source + UI Fighter audio mixer (open the UI Fighter Mixer icon)"
